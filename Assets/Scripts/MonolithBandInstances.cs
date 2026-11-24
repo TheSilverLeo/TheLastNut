@@ -2,6 +2,22 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
 
+public readonly struct MonolithRodLocalPose
+{
+    public MonolithRodLocalPose(int column, int row, Vector3 localPosition, Quaternion localRotation)
+    {
+        Column = column;
+        Row = row;
+        LocalPosition = localPosition;
+        LocalRotation = localRotation;
+    }
+
+    public int Column { get; }
+    public int Row { get; }
+    public Vector3 LocalPosition { get; }
+    public Quaternion LocalRotation { get; }
+}
+
 public sealed class MonolithBandInstanceSet
 {
     public MonolithBandDrawGroup[] Groups = System.Array.Empty<MonolithBandDrawGroup>();
@@ -19,6 +35,14 @@ public sealed class MonolithBandInstanceSet
             return count;
         }
     }
+
+    public void ApplyNutVisibility(MonolithNutState state, int faceIndex, MonolithNutFlightBoard hidden)
+    {
+        bool filter = state != null
+            && (state.FaceHasRemoval(faceIndex) || (hidden != null && hidden.FaceHasHiddenNut(faceIndex)));
+        for (int i = 0; i < Groups.Length; i++)
+            Groups[i].ApplyNutVisibility(state, faceIndex, filter, hidden);
+    }
 }
 
 public sealed class MonolithBandDrawGroup
@@ -32,7 +56,56 @@ public sealed class MonolithBandDrawGroup
     public ReflectionProbeUsage ReflectionProbeUsage;
     public MotionVectorGenerationMode MotionVectors;
     public Matrix4x4[] LocalToContainer = System.Array.Empty<Matrix4x4>();
+    public int[] NutRodIndex = System.Array.Empty<int>();
+    public int[] NutSlotIndex = System.Array.Empty<int>();
+    public bool TracksNuts;
+    public Matrix4x4[] VisibleToContainer = System.Array.Empty<Matrix4x4>();
+    public int VisibleCount;
+    public bool UseVisibility;
     public Bounds LocalBounds;
+
+    public void ApplyNutVisibility(MonolithNutState state, int faceIndex, bool filter, MonolithNutFlightBoard hidden)
+    {
+        if (!filter || !TracksNuts || state == null)
+        {
+            UseVisibility = false;
+            return;
+        }
+
+        int matrixCount = LocalToContainer.Length;
+        if (NutRodIndex.Length != matrixCount || NutSlotIndex.Length != matrixCount || state.ColumnCount < 1)
+        {
+            UseVisibility = false;
+            return;
+        }
+
+        if (VisibleToContainer.Length != matrixCount)
+            VisibleToContainer = new Matrix4x4[matrixCount];
+
+        int count = 0;
+        int columnCount = state.ColumnCount;
+        for (int i = 0; i < matrixCount; i++)
+        {
+            int slot = NutSlotIndex[i];
+            if (slot < 0)
+            {
+                VisibleToContainer[count++] = LocalToContainer[i];
+                continue;
+            }
+
+            MonolithNutState.FaceCoordinates(NutRodIndex[i], columnCount, out int column, out int row);
+            if (!state.IsSlotPresent(new MonolithRodId(faceIndex, column, row), slot))
+                continue;
+
+            if (hidden != null && hidden.IsHidden(faceIndex, NutRodIndex[i], slot))
+                continue;
+
+            VisibleToContainer[count++] = LocalToContainer[i];
+        }
+
+        VisibleCount = count;
+        UseVisibility = true;
+    }
 }
 
 public static class MonolithBandInstances
@@ -117,7 +190,7 @@ public static class MonolithBandInstances
             for (int sourceIndex = 0; sourceIndex < rodSources.Count; sourceIndex++)
             {
                 MeshSource source = rodSources[sourceIndex];
-                AddMatrices(groups, source, rodOnContainer * source.LocalToPlacementRoot);
+                AddMatrices(groups, source, rodOnContainer * source.LocalToPlacementRoot, -1, -1);
             }
 
             int rotationSeed = faceIndex >= 0
@@ -137,7 +210,7 @@ public static class MonolithBandInstances
                 for (int sourceIndex = 0; sourceIndex < nutSources.Count; sourceIndex++)
                 {
                     MeshSource source = nutSources[sourceIndex];
-                    AddMatrices(groups, source, rodOnContainer * nutOnRod * source.LocalToPlacementRoot);
+                    AddMatrices(groups, source, rodOnContainer * nutOnRod * source.LocalToPlacementRoot, pointIndex, slotIndex);
                 }
             }
 
@@ -169,11 +242,48 @@ public static class MonolithBandInstances
 
     static Matrix4x4 RodOnContainer(Transform container, Transform faceAnchor, Transform rodRoot, RodGridPoint point)
     {
-        Vector3 worldPosition = faceAnchor.TransformPoint(point.AnchorLocalPosition);
-        Quaternion worldRotation = faceAnchor.rotation;
-        Vector3 localPosition = container.InverseTransformPoint(worldPosition);
-        Quaternion localRotation = Quaternion.Inverse(container.rotation) * worldRotation;
+        RodPoseOnContainer(container, faceAnchor, point, out Vector3 localPosition, out Quaternion localRotation);
         return Matrix4x4.TRS(localPosition, localRotation, rodRoot.localScale);
+    }
+
+    static void RodPoseOnContainer(
+        Transform container,
+        Transform faceAnchor,
+        RodGridPoint point,
+        out Vector3 localPosition,
+        out Quaternion localRotation)
+    {
+        Vector3 worldPosition = faceAnchor.TransformPoint(point.AnchorLocalPosition);
+        localPosition = container.InverseTransformPoint(worldPosition);
+        localRotation = Quaternion.Inverse(container.rotation) * faceAnchor.rotation;
+    }
+
+    public static bool TryAppendRodPoses(
+        Transform container,
+        Transform faceAnchor,
+        int columnCount,
+        int rowCount,
+        float horizontalSpacing,
+        float verticalSpacing,
+        bool reverseColumnDirection,
+        List<MonolithRodLocalPose> results)
+    {
+        if (container == null || faceAnchor == null || results == null || columnCount < 1 || rowCount < 1)
+            return false;
+
+        RodGridPoint[] points = RodTestGridLayout.Build(
+            columnCount,
+            rowCount,
+            horizontalSpacing,
+            verticalSpacing,
+            reverseColumnDirection);
+        for (int i = 0; i < points.Length; i++)
+        {
+            RodPoseOnContainer(container, faceAnchor, points[i], out Vector3 localPosition, out Quaternion localRotation);
+            results.Add(new MonolithRodLocalPose(points[i].Column, points[i].Row, localPosition, localRotation));
+        }
+
+        return true;
     }
 
     static int SeedForRod(int baseSeed, int column, int row)
@@ -185,6 +295,204 @@ public static class MonolithBandInstances
             seed = (seed * 397) ^ ((row + 1) * 17);
             return seed;
         }
+    }
+
+    public static bool TryMeasureRodLength(GameObject rodPrefab, out float rodLength, out string error)
+    {
+        rodLength = 0f;
+        error = null;
+        if (rodPrefab == null)
+        {
+            error = "Assign Rod Prefab before unscrewing a nut.";
+            return false;
+        }
+
+        Transform rodRoot = rodPrefab.transform;
+        if (!TryResolveParts(rodRoot, out Transform rodTip, out _, out _))
+        {
+            error = "Rod_Template must contain Rod_Tip, Nut_Anchor, and Nut.";
+            return false;
+        }
+
+        rodLength = LocalToAncestor(rodRoot, rodTip).GetPosition().z;
+        if (rodLength <= 0f)
+        {
+            error = "Rod_Tip must sit on this rod's local +Z axis, beyond the base.";
+            return false;
+        }
+
+        return true;
+    }
+
+    public static bool TryRodOnContainer(
+        Transform container,
+        Transform faceAnchor,
+        GameObject rodPrefab,
+        int columnCount,
+        int rowCount,
+        float horizontalSpacing,
+        float verticalSpacing,
+        bool reverseColumnDirection,
+        int column,
+        int row,
+        out Matrix4x4 rodOnContainer)
+    {
+        rodOnContainer = Matrix4x4.identity;
+        if (container == null || faceAnchor == null || rodPrefab == null)
+            return false;
+
+        RodGridPoint[] points = RodTestGridLayout.Build(
+            columnCount,
+            rowCount,
+            horizontalSpacing,
+            verticalSpacing,
+            reverseColumnDirection);
+        for (int i = 0; i < points.Length; i++)
+        {
+            if (points[i].Column != column || points[i].Row != row)
+                continue;
+
+            rodOnContainer = RodOnContainer(container, faceAnchor, rodPrefab.transform, points[i]);
+            return true;
+        }
+
+        return false;
+    }
+
+    public static bool TryNutRodZ(
+        RodNutTestSettings nutSettings,
+        float rodLength,
+        int faceIndex,
+        int column,
+        int row,
+        int slotIndex,
+        out float rodLocalZ,
+        out string error)
+    {
+        rodLocalZ = 0f;
+        if (nutSettings == null)
+        {
+            error = "Assign Nut Settings before unscrewing a nut.";
+            return false;
+        }
+
+        int seed = SeedForRodOnFace(nutSettings.RotationSeed, faceIndex, column, row);
+        if (!RodNutLayout.TryBuild(nutSettings, rodLength, seed, out NutSlot[] slots, out error))
+            return false;
+
+        if (slotIndex < 0 || slotIndex >= slots.Length)
+        {
+            error = "That nut is not on this rod.";
+            return false;
+        }
+
+        rodLocalZ = slots[slotIndex].RodLocalZ;
+        return true;
+    }
+
+    public static bool TryCopyNutCenters(
+        GameObject rodPrefab,
+        RodNutTestSettings nutSettings,
+        int faceIndex,
+        int column,
+        int row,
+        float[] centers,
+        out int count)
+    {
+        count = 0;
+        if (centers == null || !TrySlots(rodPrefab, nutSettings, faceIndex, column, row, out NutSlot[] slots))
+            return false;
+
+        if (centers.Length < slots.Length)
+            return false;
+
+        for (int i = 0; i < slots.Length; i++)
+            centers[i] = slots[i].RodLocalZ;
+
+        count = slots.Length;
+        return true;
+    }
+
+    public static bool TryNutLocalToContainer(
+        Transform container,
+        Transform faceAnchor,
+        GameObject rodPrefab,
+        MonolithBandPreviewSettings bandSettings,
+        RodNutTestSettings nutSettings,
+        bool reverseColumnDirection,
+        int faceIndex,
+        int column,
+        int row,
+        int nutIndex,
+        out Matrix4x4 localToContainer)
+    {
+        localToContainer = Matrix4x4.identity;
+        if (container == null || faceAnchor == null || bandSettings == null)
+            return false;
+
+        if (!TryRodOnContainer(
+                container,
+                faceAnchor,
+                rodPrefab,
+                bandSettings.ColumnCount,
+                bandSettings.RowCount,
+                bandSettings.HorizontalSpacing,
+                bandSettings.VerticalSpacing,
+                reverseColumnDirection,
+                column,
+                row,
+                out Matrix4x4 rodOnContainer))
+            return false;
+
+        if (!TrySlots(rodPrefab, nutSettings, faceIndex, column, row, out NutSlot[] slots))
+            return false;
+
+        if (nutIndex < 0 || nutIndex >= slots.Length)
+            return false;
+
+        if (!TryResolveParts(rodPrefab.transform, out _, out Transform nutAnchor, out Transform referenceNut))
+            return false;
+
+        RodNutReferencePose pose = RodNutReferencePose.Capture(nutAnchor, referenceNut);
+        NutSlot slot = slots[nutIndex];
+        Matrix4x4 nutOnRod = nutIndex == slots.Length - 1
+            ? pose.ReferenceLocalMatrix(slot.RodLocalZ, slot.SpinDegrees)
+            : pose.CopyLocalMatrix(slot.RodLocalZ, slot.SpinDegrees);
+        localToContainer = rodOnContainer * nutOnRod;
+        return true;
+    }
+
+    public static bool TryGetNutMesh(GameObject rodPrefab, out Mesh mesh)
+    {
+        mesh = null;
+        if (rodPrefab == null || !TryResolveParts(rodPrefab.transform, out _, out _, out Transform referenceNut))
+            return false;
+
+        MeshFilter filter = referenceNut.GetComponent<MeshFilter>();
+        if (filter == null || filter.sharedMesh == null)
+            return false;
+
+        mesh = filter.sharedMesh;
+        return true;
+    }
+
+    static bool TrySlots(
+        GameObject rodPrefab,
+        RodNutTestSettings nutSettings,
+        int faceIndex,
+        int column,
+        int row,
+        out NutSlot[] slots)
+    {
+        slots = null;
+        if (rodPrefab == null || nutSettings == null)
+            return false;
+
+        if (!TryMeasureRodLength(rodPrefab, out float rodLength, out _))
+            return false;
+
+        int seed = SeedForRodOnFace(nutSettings.RotationSeed, faceIndex, column, row);
+        return RodNutLayout.TryBuild(nutSettings, rodLength, seed, out slots, out _);
     }
 
     static int SeedForRodOnFace(int baseSeed, int faceIndex, int column, int row)
@@ -281,7 +589,12 @@ public static class MonolithBandInstances
         return true;
     }
 
-    static void AddMatrices(List<GroupBuild> groups, MeshSource source, Matrix4x4 localToContainer)
+    static void AddMatrices(
+        List<GroupBuild> groups,
+        MeshSource source,
+        Matrix4x4 localToContainer,
+        int rodIndex,
+        int slotIndex)
     {
         Material[] materials = source.Renderer.sharedMaterials;
         if (materials == null || materials.Length == 0)
@@ -296,6 +609,8 @@ public static class MonolithBandInstances
 
             GroupBuild group = FindOrAdd(groups, source, submesh, material);
             group.Matrices.Add(localToContainer);
+            group.RodIndices.Add(rodIndex);
+            group.SlotIndices.Add(slotIndex);
             Bounds transformed = TransformBounds(localToContainer, source.Mesh.bounds);
             if (!group.HasBounds)
             {
@@ -328,7 +643,9 @@ public static class MonolithBandInstances
             LightProbeUsage = source.Renderer.lightProbeUsage,
             ReflectionProbeUsage = source.Renderer.reflectionProbeUsage,
             MotionVectors = source.Renderer.motionVectorGenerationMode,
-            Matrices = new List<Matrix4x4>()
+            Matrices = new List<Matrix4x4>(),
+            RodIndices = new List<int>(),
+            SlotIndices = new List<int>()
         };
         groups.Add(created);
         return created;
@@ -340,6 +657,16 @@ public static class MonolithBandInstances
         for (int i = 0; i < groups.Count; i++)
         {
             GroupBuild group = groups[i];
+            bool tracksNuts = false;
+            for (int slot = 0; slot < group.SlotIndices.Count; slot++)
+            {
+                if (group.SlotIndices[slot] < 0)
+                    continue;
+
+                tracksNuts = true;
+                break;
+            }
+
             frozen[i] = new MonolithBandDrawGroup
             {
                 Mesh = group.Mesh,
@@ -351,6 +678,9 @@ public static class MonolithBandInstances
                 ReflectionProbeUsage = group.ReflectionProbeUsage,
                 MotionVectors = group.MotionVectors,
                 LocalToContainer = group.Matrices.ToArray(),
+                NutRodIndex = group.RodIndices.ToArray(),
+                NutSlotIndex = group.SlotIndices.ToArray(),
+                TracksNuts = tracksNuts,
                 LocalBounds = group.LocalBounds
             };
         }
@@ -398,6 +728,8 @@ public static class MonolithBandInstances
         public ReflectionProbeUsage ReflectionProbeUsage;
         public MotionVectorGenerationMode MotionVectors;
         public List<Matrix4x4> Matrices;
+        public List<int> RodIndices;
+        public List<int> SlotIndices;
         public Bounds LocalBounds;
         public bool HasBounds;
     }

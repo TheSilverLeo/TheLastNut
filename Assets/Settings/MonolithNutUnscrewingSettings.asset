@@ -1,0 +1,22 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d1e7b4a28c6f49e0a5b3c8d1f0473298, type: 3}
+  m_Name: MonolithNutUnscrewingSettings
+  m_EditorClassIdentifier: 
+  movementSpeed: 0.4
+  rotationSpeed: 720
+  minimumDuration: 0.8
+  mass: 0.4
+  bounciness: 0.2
+  friction: 0.45
+  outwardVelocity: 0.5
+  angularVelocity: 720

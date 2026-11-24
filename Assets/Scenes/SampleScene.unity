@@ -162,6 +162,8 @@ GameObject:
   - component: {fileID: 318975856}
   - component: {fileID: 318975858}
   - component: {fileID: 318975859}
+  - component: {fileID: 318975860}
+  - component: {fileID: 318975861}
   m_Layer: 0
   m_Name: Monolith_Controller
   m_TagString: Untagged
@@ -240,6 +242,7 @@ MonoBehaviour:
   showPreview: 1
   bandSettings: {fileID: 11400000, guid: 4d7c2a9e1b6f48c0a5e3d8b7f1c04629, type: 2}
   nutSettings: {fileID: 11400000, guid: 7d4b1e9c0a6f42e8b5c3d1a7f8e02640, type: 2}
+  unscrewingSettings: {fileID: 11400000, guid: e2f8c5b39d7a40f1b6c4d9e2a8f13764, type: 2}
   rodPrefab: {fileID: 6298593848927623233, guid: c02fa10a350019e42acf478f20c3924f, type: 3}
   oneFacePreview: {fileID: 318975858}
   faces:
@@ -254,6 +257,37 @@ MonoBehaviour:
   shadowCastingMode: 1
   receiveShadows: 1
   maxInstancesPerDraw: 1023
+--- !u!114 &318975860
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 318975855}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: c2d5f8b39e7a40f1b6c4d9e2a15843bb, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  settings: {fileID: 11400000, guid: d3e6a9c40f8b41a2c7d5e0f3b26954cc, type: 2}
+  band: {fileID: 318975859}
+  player: {fileID: 1056788197}
+  showColliderGizmos: 1
+--- !u!114 &318975861
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 318975855}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 00952b4a6d249094e9349c91cb0fb734, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  band: {fileID: 318975859}
+  settings: {fileID: 11400000, guid: 2dd5a483ac49e164481977259ca18108, type: 2}
+  eye: {fileID: 330585545}
 --- !u!1 &330585543
 GameObject:
   m_ObjectHideFlags: 0
@@ -498,6 +532,9 @@ GameObject:
   - component: {fileID: 1056788195}
   - component: {fileID: 1056788194}
   - component: {fileID: 1056788193}
+  - component: {fileID: 1056788198}
+  - component: {fileID: 1056788199}
+  - component: {fileID: 1056788200}
   m_Layer: 0
   m_Name: Player
   m_TagString: Untagged
@@ -622,6 +659,55 @@ Transform:
   - {fileID: 330585546}
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1056788198
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1056788192}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d8f3e5c40b9a42d1c7e6f2a5b4817633, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  settings: {fileID: 11400000, guid: e9a4f6d51c0b43e2d8f7a3b6c5928744, type: 2}
+  eye: {fileID: 330585546}
+  bodyRenderer: {fileID: 1056788195}
+  redundantCollider: {fileID: 1056788194}
+--- !u!114 &1056788199
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1056788192}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 45d9d38d7b849d0498d0e4ed0a30b09a, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  settings: {fileID: 11400000, guid: 2dd5a483ac49e164481977259ca18108, type: 2}
+  eye: {fileID: 330585546}
+  rods: {fileID: 318975860}
+  band: {fileID: 318975859}
+  highlights: {fileID: 318975861}
+--- !u!114 &1056788200
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1056788192}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b7c1e4a92f6d4c08a1e5d3b9c7f24018, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  targeting: {fileID: 1056788199}
+  band: {fileID: 318975859}
+  highlights: {fileID: 318975861}
+  player: {fileID: 1056788198}
 --- !u!65 &1092839836
 BoxCollider:
   m_ObjectHideFlags: 0

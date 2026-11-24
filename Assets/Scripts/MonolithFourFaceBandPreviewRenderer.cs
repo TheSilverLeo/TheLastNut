@@ -17,6 +17,9 @@ public class MonolithFourFaceBandPreviewRenderer : MonoBehaviour
     [Tooltip("Nut count, spacing, and 0–360° spin. Each rod gets its own seed from the face, column, and row.")]
     [SerializeField] RodNutTestSettings nutSettings;
 
+    [Tooltip("Movement speed, spin speed, and the shortest unscrewing time.")]
+    [SerializeField] MonolithNutUnscrewingSettings unscrewingSettings;
+
     [Tooltip("Rod_Template prefab asset. Meshes and materials are read from it.")]
     [SerializeField] GameObject rodPrefab;
 
@@ -40,11 +43,47 @@ public class MonolithFourFaceBandPreviewRenderer : MonoBehaviour
     bool _hasBuilt;
     bool _hasFailure;
     bool _loggedOneFaceOverlap;
+    bool _visibilityDirty;
+    MonolithNutState _nutState;
+    readonly MonolithNutFlightBoard _flights = new MonolithNutFlightBoard();
+    readonly List<MonolithNutFlight> _readyFlights = new List<MonolithNutFlight>(4);
+    readonly MonolithDetachedNutPool _detachedNuts = new MonolithDetachedNutPool();
+    readonly Matrix4x4[] _flyingMatrix = new Matrix4x4[1];
+    int _completedDetachments;
+    int _lastGameplayFrame = -1;
+    int _playGeneration;
+    bool _advancingGameplay;
+#if UNITY_EDITOR
+    bool _repaintQueued;
+#endif
 
     public MonolithBandPreviewSettings BandSettings => bandSettings;
+    public GameObject RodPrefab => rodPrefab;
+    public int FaceSlotCount => faces != null ? faces.Length : 0;
     public RodNutTestSettings NutSettings => nutSettings;
     public bool ShowPreview => showPreview;
     public MonolithBandPreviewRenderer OneFacePreview => oneFacePreview;
+    public MonolithNutState NutState => Application.isPlaying ? _nutState : null;
+    public MonolithNutUnscrewingSettings UnscrewingSettings => unscrewingSettings;
+    public bool HasActiveUnscrewing => _flights.Count > 0;
+    public int ActiveUnscrewingCount => _flights.UnscrewingCount;
+    public int CompletedDetachmentCount => _completedDetachments;
+    public int ActivePhysicsNutCount => _detachedNuts.ActiveCount;
+    public int InactivePooledNutCount => _detachedNuts.InactiveCount;
+    public int TotalPoolSize => _detachedNuts.TotalCount;
+    public int TotalRemovedNuts => _nutState != null ? _nutState.RemovedCount : 0;
+
+    public bool TryGetFace(int index, out MonolithFaceAnchor face)
+    {
+        if (faces == null || index < 0 || index >= faces.Length)
+        {
+            face = default;
+            return false;
+        }
+
+        face = faces[index];
+        return face.Anchor != null;
+    }
 
     public int BuiltRodCount
     {
@@ -84,6 +123,27 @@ public class MonolithFourFaceBandPreviewRenderer : MonoBehaviour
     {
         RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering;
         RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering;
+        if (Application.isPlaying)
+        {
+            if (_playGeneration == 0)
+            {
+                _playGeneration = 1;
+                _nutState = null;
+                _completedDetachments = 0;
+                _lastGameplayFrame = -1;
+            }
+
+            EnsureNutState();
+            _visibilityDirty = true;
+        }
+        else
+        {
+            _playGeneration = 0;
+            _nutState = null;
+            _completedDetachments = 0;
+            _lastGameplayFrame = -1;
+            _visibilityDirty = false;
+        }
 #if UNITY_EDITOR
         if (!Application.isPlaying && showPreview)
             UnityEditor.SceneView.RepaintAll();
@@ -94,13 +154,22 @@ public class MonolithFourFaceBandPreviewRenderer : MonoBehaviour
     {
         RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering;
         ReleaseInstances();
+        _flights.CancelAll();
+        _detachedNuts.Dispose();
+        _nutState = null;
+        _completedDetachments = 0;
+        _lastGameplayFrame = -1;
+        _playGeneration = 0;
+        _advancingGameplay = false;
+        _visibilityDirty = false;
     }
 
     void OnValidate()
     {
         EnsureFaces();
 #if UNITY_EDITOR
-        UnityEditor.SceneView.RepaintAll();
+        if (!Application.isPlaying)
+            UnityEditor.SceneView.RepaintAll();
 #endif
     }
 
@@ -128,13 +197,520 @@ public class MonolithFourFaceBandPreviewRenderer : MonoBehaviour
         {
             if (!TryRebuild(signature))
                 return;
+
+            _visibilityDirty = true;
         }
 
         if (_faces == null)
             return;
 
+        if (Application.isPlaying)
+        {
+            EnsureNutState();
+            if (_visibilityDirty)
+                ApplyAllVisibility();
+        }
+
         Draw(camera);
+        DrawFlights(camera);
+        BandRendered?.Invoke(camera);
     }
+
+    void Update()
+    {
+        // Gameplay advances once per player frame. Camera rendering, Scene View
+        // repaints, and URP passes must not re-enter this step.
+        if (!Application.isPlaying || _advancingGameplay || _flights.Count == 0)
+            return;
+
+        int frame = Time.frameCount;
+        if (frame == _lastGameplayFrame)
+            return;
+
+        _advancingGameplay = true;
+        _lastGameplayFrame = frame;
+        try
+        {
+            _flights.CopyReady(_readyFlights);
+            for (int i = 0; i < _readyFlights.Count; i++)
+            {
+                MonolithNutFlight flight = _readyFlights[i];
+                if (!_flights.TryBeginDetach(flight))
+                    continue;
+
+                if (!TryDetach(flight))
+                {
+                    flight.Phase = MonolithNutFlightPhase.Unscrewing;
+                    continue;
+                }
+
+                _flights.Release(flight);
+                _completedDetachments++;
+                if (_nutState != null)
+                    _nutState.TryRemoveOutermost(flight.Rod);
+
+                if (!ApplyVisibility(flight.Rod.Face))
+                    _visibilityDirty = true;
+            }
+
+            _flights.Tick(Time.deltaTime);
+            RequestPreviewRepaint();
+        }
+        finally
+        {
+            _advancingGameplay = false;
+        }
+    }
+
+    bool TryDetach(MonolithNutFlight flight)
+    {
+        if (flight.Phase != MonolithNutFlightPhase.Detaching)
+            return false;
+
+        if (unscrewingSettings == null || !TryFlightWorldMatrix(flight, out Matrix4x4 world))
+            return false;
+
+        Quaternion rodWorld = transform.rotation * flight.RodOnContainer.rotation;
+        Vector3 outward = rodWorld * Vector3.forward;
+        var detachedId = new MonolithNutId(flight.Rod.Face, flight.Rod.Column, flight.Rod.Row, flight.SlotIndex);
+        if (!_detachedNuts.TrySpawn(
+                world,
+                detachedId,
+                flight.Pieces,
+                outward * unscrewingSettings.OutwardVelocity,
+                outward * (unscrewingSettings.AngularVelocity * Mathf.Deg2Rad),
+                shadowCastingMode,
+                receiveShadows,
+                unscrewingSettings,
+                out bool createdNew,
+                out string diagnostic,
+                out bool ready))
+            return false;
+
+        string message =
+            $"Detached nut face {flight.Rod.Face}, column {flight.Rod.Column}, row {flight.Rod.Row}, nut index {flight.SlotIndex}. " +
+            (createdNew ? "Created a new physics nut." : "Reused a pooled physics nut.") +
+            "\n" + diagnostic;
+        if (ready)
+            Debug.Log(message, this);
+        else
+            Debug.LogError(message, this);
+
+        return true;
+    }
+
+    bool TryFlightWorldMatrix(MonolithNutFlight flight, out Matrix4x4 world)
+    {
+        world = Matrix4x4.identity;
+        if (flight.Pieces == null || flight.Pieces.Length == 0 || flight.Pieces[0].Mesh == null)
+            return false;
+
+        MonolithNutMotion.Sample(
+            flight.Elapsed,
+            flight.Duration,
+            flight.StartRodZ,
+            flight.EndRodZ,
+            flight.DegreesPerSecond,
+            out float rodZ,
+            out float extraDegrees);
+        Matrix4x4 shift = MonolithNutMotion.RodShift(flight, rodZ, extraDegrees);
+        world = transform.localToWorldMatrix * shift * flight.Pieces[0].BaseLocalToContainer;
+        return true;
+    }
+
+    public event System.Action<Camera> BandRendered;
+
+    public bool IsRodAnimating(MonolithRodId rod)
+    {
+        return _flights.IsRodAnimating(rod);
+    }
+
+    public bool IsNutHidden(MonolithNutId nut)
+    {
+        if (_nutState == null)
+            return false;
+
+        int rodOnFace = _nutState.RodIndexOnFace(nut.Rod);
+        return rodOnFace >= 0 && _flights.IsHidden(nut.Face, rodOnFace, nut.NutIndex);
+    }
+
+    public bool TryGetUnscrewingNut(MonolithRodId rod, out int nutIndex, out float rodLocalZ)
+    {
+        nutIndex = -1;
+        rodLocalZ = 0f;
+        for (int i = 0; i < _flights.Count; i++)
+        {
+            MonolithNutFlight flight = _flights.FlightAt(i);
+            if (!flight.Rod.Equals(rod) || flight.Phase != MonolithNutFlightPhase.Unscrewing)
+                continue;
+
+            MonolithNutMotion.Sample(
+                flight.Elapsed,
+                flight.Duration,
+                flight.StartRodZ,
+                flight.EndRodZ,
+                flight.DegreesPerSecond,
+                out rodLocalZ,
+                out _);
+            nutIndex = flight.SlotIndex;
+            return true;
+        }
+
+        return false;
+    }
+
+    public bool TryGetUnscrewingProgress(MonolithRodId rod, out float progress)
+    {
+        progress = 0f;
+        for (int i = 0; i < _flights.Count; i++)
+        {
+            MonolithNutFlight flight = _flights.FlightAt(i);
+            if (!flight.Rod.Equals(rod) || flight.Phase != MonolithNutFlightPhase.Unscrewing)
+                continue;
+
+            progress = flight.Duration > 0f ? Mathf.Clamp01(flight.Elapsed / flight.Duration) : 1f;
+            return true;
+        }
+
+        return false;
+    }
+
+    public bool TryGetNutWorldMatrix(MonolithNutId nut, out Matrix4x4 world)
+    {
+        world = Matrix4x4.identity;
+        if (!Application.isPlaying || _nutState == null || bandSettings == null || nutSettings == null || rodPrefab == null)
+            return false;
+
+        if (!_nutState.IsSlotPresent(nut.Rod, nut.NutIndex))
+            return false;
+
+        if (!TryGetFace(nut.Face, out MonolithFaceAnchor face))
+            return false;
+
+        if (!MonolithBandInstances.TryNutLocalToContainer(
+                transform,
+                face.Anchor,
+                rodPrefab,
+                bandSettings,
+                nutSettings,
+                face.ReverseColumnDirection,
+                nut.Face,
+                nut.Column,
+                nut.Row,
+                nut.NutIndex,
+                out Matrix4x4 local))
+            return false;
+
+        if (TryGetUnscrewingShift(nut, out Matrix4x4 shift))
+            local = shift * local;
+        else if (IsNutHidden(nut))
+            return false;
+
+        world = transform.localToWorldMatrix * local;
+        return true;
+    }
+
+    bool TryGetUnscrewingShift(MonolithNutId nut, out Matrix4x4 shift)
+    {
+        shift = Matrix4x4.identity;
+        for (int i = 0; i < _flights.Count; i++)
+        {
+            MonolithNutFlight flight = _flights.FlightAt(i);
+            if (flight.Phase != MonolithNutFlightPhase.Unscrewing || flight.SlotIndex != nut.NutIndex || !flight.Rod.Equals(nut.Rod))
+                continue;
+
+            MonolithNutMotion.Sample(
+                flight.Elapsed,
+                flight.Duration,
+                flight.StartRodZ,
+                flight.EndRodZ,
+                flight.DegreesPerSecond,
+                out float rodZ,
+                out float extraDegrees);
+            shift = MonolithNutMotion.RodShift(flight, rodZ, extraDegrees);
+            return true;
+        }
+
+        return false;
+    }
+
+    public bool TryAnimateOneNut(MonolithRodId rod)
+    {
+        if (!Application.isPlaying || bandSettings == null || nutSettings == null || rodPrefab == null || unscrewingSettings == null)
+            return false;
+
+        EnsureNutState();
+        EnsureFaces();
+        if (_nutState == null || _faces == null || !_nutState.Contains(rod) || _flights.IsRodAnimating(rod))
+            return false;
+
+        int remaining = _nutState.Remaining(rod);
+        if (remaining <= 0 || rod.Face >= _faces.Length || _faces[rod.Face] == null)
+            return false;
+
+        int slot = remaining - 1;
+        int rodOnFace = _nutState.RodIndexOnFace(rod);
+        if (!MonolithBandInstances.TryMeasureRodLength(rodPrefab, out float rodLength, out string error))
+        {
+            Debug.LogWarning(error, this);
+            return false;
+        }
+
+        if (!MonolithBandInstances.TryNutRodZ(
+                nutSettings,
+                rodLength,
+                rod.Face,
+                rod.Column,
+                rod.Row,
+                slot,
+                out float startRodZ,
+                out error))
+        {
+            Debug.LogWarning(error, this);
+            return false;
+        }
+
+        MonolithFaceAnchor face = faces[rod.Face];
+        if (!MonolithBandInstances.TryRodOnContainer(
+                transform,
+                face.Anchor,
+                rodPrefab,
+                bandSettings.ColumnCount,
+                bandSettings.RowCount,
+                bandSettings.HorizontalSpacing,
+                bandSettings.VerticalSpacing,
+                face.ReverseColumnDirection,
+                rod.Column,
+                rod.Row,
+                out Matrix4x4 rodOnContainer))
+        {
+            Debug.LogWarning("Could not place the unscrewing nut on its rod.", this);
+            return false;
+        }
+
+        if (!TryCapturePieces(_faces[rod.Face], rodOnFace, slot, out MonolithNutFlightPiece[] pieces))
+        {
+            Debug.LogWarning("Could not find that nut in the instanced band.", this);
+            return false;
+        }
+
+        float endRodZ = MonolithNutMotion.EndRodZ(rodLength, nutSettings.NutThickness);
+        var flight = new MonolithNutFlight
+        {
+            Rod = rod,
+            RodOnFace = rodOnFace,
+            SlotIndex = slot,
+            StartRodZ = startRodZ,
+            EndRodZ = endRodZ,
+            Duration = MonolithNutMotion.Duration(
+                startRodZ,
+                endRodZ,
+                unscrewingSettings.MovementSpeed,
+                unscrewingSettings.MinimumDuration),
+            DegreesPerSecond = unscrewingSettings.RotationSpeed,
+            RodOnContainer = rodOnContainer,
+            ContainerToRod = Matrix4x4.Inverse(rodOnContainer),
+            Pieces = pieces,
+            LocalPathBounds = PathBounds(rodOnContainer, endRodZ - startRodZ, pieces)
+        };
+
+        _flights.Add(flight);
+        if (!ApplyVisibility(rod.Face))
+            _visibilityDirty = true;
+
+        RequestPreviewRepaint();
+        return true;
+    }
+
+    static bool TryCapturePieces(MonolithBandInstanceSet set, int rodOnFace, int slot, out MonolithNutFlightPiece[] pieces)
+    {
+        pieces = null;
+        MonolithBandDrawGroup[] groups = set.Groups;
+        int count = 0;
+        for (int groupIndex = 0; groupIndex < groups.Length; groupIndex++)
+        {
+            MonolithBandDrawGroup group = groups[groupIndex];
+            if (!group.TracksNuts)
+                continue;
+
+            int matrixCount = group.LocalToContainer.Length;
+            for (int i = 0; i < matrixCount; i++)
+            {
+                if (group.NutRodIndex[i] == rodOnFace && group.NutSlotIndex[i] == slot)
+                    count++;
+            }
+        }
+
+        if (count == 0)
+            return false;
+
+        pieces = new MonolithNutFlightPiece[count];
+        int write = 0;
+        for (int groupIndex = 0; groupIndex < groups.Length; groupIndex++)
+        {
+            MonolithBandDrawGroup group = groups[groupIndex];
+            if (!group.TracksNuts)
+                continue;
+
+            int matrixCount = group.LocalToContainer.Length;
+            for (int i = 0; i < matrixCount; i++)
+            {
+                if (group.NutRodIndex[i] != rodOnFace || group.NutSlotIndex[i] != slot)
+                    continue;
+
+                pieces[write++] = new MonolithNutFlightPiece
+                {
+                    Mesh = group.Mesh,
+                    SubmeshIndex = group.SubmeshIndex,
+                    SourceMaterial = group.SourceMaterial,
+                    BaseLocalToContainer = group.LocalToContainer[i],
+                    Layer = group.Layer,
+                    RenderingLayerMask = group.RenderingLayerMask,
+                    LightProbeUsage = group.LightProbeUsage,
+                    ReflectionProbeUsage = group.ReflectionProbeUsage,
+                    MotionVectors = group.MotionVectors
+                };
+            }
+        }
+
+        return true;
+    }
+
+    static Bounds PathBounds(Matrix4x4 rodOnContainer, float travelDistance, MonolithNutFlightPiece[] pieces)
+    {
+        bool hasBounds = false;
+        Bounds bounds = new Bounds(rodOnContainer.GetPosition(), Vector3.zero);
+        Vector3 travel = rodOnContainer.MultiplyVector(Vector3.forward * travelDistance);
+        for (int i = 0; i < pieces.Length; i++)
+        {
+            if (pieces[i].Mesh == null)
+                continue;
+
+            Bounds start = MonolithBandInstances.TransformBounds(pieces[i].BaseLocalToContainer, pieces[i].Mesh.bounds);
+            if (!hasBounds)
+            {
+                bounds = start;
+                hasBounds = true;
+            }
+            else
+            {
+                bounds.Encapsulate(start);
+            }
+
+            Bounds end = start;
+            end.center += travel;
+            bounds.Encapsulate(end);
+        }
+
+        return bounds;
+    }
+
+    public bool TryRemoveOneNut(MonolithRodId rod)
+    {
+        if (!Application.isPlaying)
+            return false;
+
+        EnsureNutState();
+        if (_nutState == null || _flights.IsRodAnimating(rod) || !_nutState.TryRemoveOutermost(rod))
+            return false;
+
+        if (!ApplyVisibility(rod.Face))
+            _visibilityDirty = true;
+
+        RequestPreviewRepaint();
+        return true;
+    }
+
+    public void ResetAllNuts()
+    {
+        if (!Application.isPlaying)
+            return;
+
+        _flights.CancelAll();
+        _detachedNuts.ReleaseAll();
+        _completedDetachments = 0;
+        EnsureNutState();
+        if (_nutState == null)
+            return;
+
+        _nutState.Reset();
+        if (!ApplyAllVisibility())
+            _visibilityDirty = true;
+
+        RequestPreviewRepaint();
+    }
+
+    void EnsureNutState()
+    {
+        if (!Application.isPlaying || bandSettings == null || nutSettings == null)
+            return;
+
+        if (bandSettings.ColumnCount < 1
+            || bandSettings.RowCount < 1
+            || nutSettings.NutCount < 1
+            || nutSettings.NutCount > ushort.MaxValue)
+            return;
+
+        if (_nutState != null && _nutState.Matches(
+                FaceCount,
+                bandSettings.ColumnCount,
+                bandSettings.RowCount,
+                nutSettings.NutCount))
+            return;
+
+        _nutState = new MonolithNutState(
+            FaceCount,
+            bandSettings.ColumnCount,
+            bandSettings.RowCount,
+            nutSettings.NutCount);
+        _visibilityDirty = true;
+    }
+
+    bool ApplyVisibility(int faceIndex)
+    {
+        if (_faces == null || _nutState == null || faceIndex < 0 || faceIndex >= _faces.Length || _faces[faceIndex] == null)
+            return false;
+
+        _faces[faceIndex].ApplyNutVisibility(_nutState, faceIndex, _flights);
+        return true;
+    }
+
+    bool ApplyAllVisibility()
+    {
+        if (_faces == null || _nutState == null)
+            return false;
+
+        for (int i = 0; i < _faces.Length; i++)
+        {
+            if (_faces[i] != null)
+                _faces[i].ApplyNutVisibility(_nutState, i, _flights);
+        }
+
+        _visibilityDirty = false;
+        return true;
+    }
+
+    void RequestPreviewRepaint()
+    {
+#if UNITY_EDITOR
+        if (_repaintQueued)
+            return;
+
+        _repaintQueued = true;
+        UnityEditor.EditorApplication.delayCall += FlushPreviewRepaint;
+#endif
+    }
+
+#if UNITY_EDITOR
+    void FlushPreviewRepaint()
+    {
+        _repaintQueued = false;
+        if (this == null)
+            return;
+
+        UnityEditor.SceneView.RepaintAll();
+    }
+#endif
 
     bool OneFaceIsShowing()
     {
@@ -234,11 +810,14 @@ public class MonolithFourFaceBandPreviewRenderer : MonoBehaviour
 
                 Material material = InstancedMaterial(group.SourceMaterial);
                 Bounds worldBounds = MonolithBandInstances.TransformBounds(containerWorld, group.LocalBounds);
-                Matrix4x4[] locals = group.LocalToContainer;
+                Matrix4x4[] locals = group.UseVisibility ? group.VisibleToContainer : group.LocalToContainer;
+                int length = group.UseVisibility ? group.VisibleCount : group.LocalToContainer.Length;
+                if (locals == null || length <= 0)
+                    continue;
 
-                for (int start = 0; start < locals.Length; start += batchSize)
+                for (int start = 0; start < length; start += batchSize)
                 {
-                    int count = Mathf.Min(batchSize, locals.Length - start);
+                    int count = Mathf.Min(batchSize, length - start);
                     for (int i = 0; i < count; i++)
                         _worldBatch[i] = containerWorld * locals[start + i];
 
@@ -256,6 +835,54 @@ public class MonolithFourFaceBandPreviewRenderer : MonoBehaviour
                     };
                     Graphics.RenderMeshInstanced(renderParams, group.Mesh, group.SubmeshIndex, _worldBatch, count);
                 }
+            }
+        }
+    }
+
+    void DrawFlights(Camera camera)
+    {
+        if (!Application.isPlaying || _flights.Count == 0)
+            return;
+
+        Matrix4x4 containerWorld = transform.localToWorldMatrix;
+        for (int flightIndex = 0; flightIndex < _flights.Count; flightIndex++)
+        {
+            MonolithNutFlight flight = _flights.FlightAt(flightIndex);
+            if (flight.Phase != MonolithNutFlightPhase.Unscrewing)
+                continue;
+
+            MonolithNutMotion.Sample(
+                flight.Elapsed,
+                flight.Duration,
+                flight.StartRodZ,
+                flight.EndRodZ,
+                flight.DegreesPerSecond,
+                out float rodZ,
+                out float extraDegrees);
+
+            Matrix4x4 shift = MonolithNutMotion.RodShift(flight, rodZ, extraDegrees);
+            Bounds worldBounds = MonolithBandInstances.TransformBounds(containerWorld, flight.LocalPathBounds);
+            MonolithNutFlightPiece[] pieces = flight.Pieces;
+            for (int pieceIndex = 0; pieceIndex < pieces.Length; pieceIndex++)
+            {
+                MonolithNutFlightPiece piece = pieces[pieceIndex];
+                if (piece.Mesh == null || piece.SourceMaterial == null)
+                    continue;
+
+                _flyingMatrix[0] = containerWorld * shift * piece.BaseLocalToContainer;
+                var renderParams = new RenderParams(InstancedMaterial(piece.SourceMaterial))
+                {
+                    camera = camera,
+                    worldBounds = worldBounds,
+                    layer = piece.Layer,
+                    renderingLayerMask = piece.RenderingLayerMask,
+                    shadowCastingMode = shadowCastingMode,
+                    receiveShadows = receiveShadows,
+                    lightProbeUsage = piece.LightProbeUsage,
+                    reflectionProbeUsage = piece.ReflectionProbeUsage,
+                    motionVectorMode = piece.MotionVectors
+                };
+                Graphics.RenderMeshInstanced(renderParams, piece.Mesh, piece.SubmeshIndex, _flyingMatrix, 1);
             }
         }
     }

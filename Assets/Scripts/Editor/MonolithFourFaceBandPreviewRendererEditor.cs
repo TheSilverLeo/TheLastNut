@@ -5,6 +5,9 @@ using UnityEngine;
 public class MonolithFourFaceBandPreviewRendererEditor : Editor
 {
     const float ButtonHeight = 28f;
+    const string FaceKey = "TheLastRivet.NutRemoval.Face";
+    const string ColumnKey = "TheLastRivet.NutRemoval.Column";
+    const string RowKey = "TheLastRivet.NutRemoval.Row";
 
     void OnEnable()
     {
@@ -28,6 +31,7 @@ public class MonolithFourFaceBandPreviewRendererEditor : Editor
         EditorGUILayout.PropertyField(serializedObject.FindProperty("showPreview"));
         EditorGUILayout.PropertyField(serializedObject.FindProperty("bandSettings"));
         EditorGUILayout.PropertyField(serializedObject.FindProperty("nutSettings"));
+        EditorGUILayout.PropertyField(serializedObject.FindProperty("unscrewingSettings"));
         EditorGUILayout.PropertyField(serializedObject.FindProperty("rodPrefab"));
         EditorGUILayout.PropertyField(serializedObject.FindProperty("oneFacePreview"));
         DrawFaces();
@@ -57,6 +61,8 @@ public class MonolithFourFaceBandPreviewRendererEditor : Editor
 
         if (GUILayout.Button("Hide Four-Face Band", GUILayout.Height(ButtonHeight)))
             SetPreviewVisible(false);
+
+        DrawNutRemoval(preview);
     }
 
     public override bool RequiresConstantRepaint()
@@ -149,5 +155,120 @@ public class MonolithFourFaceBandPreviewRendererEditor : Editor
         var otherObject = new SerializedObject(other);
         otherObject.FindProperty("showPreview").boolValue = false;
         otherObject.ApplyModifiedProperties();
+    }
+
+    void DrawNutRemoval(MonolithFourFaceBandPreviewRenderer preview)
+    {
+        EditorGUILayout.Space();
+        EditorGUILayout.LabelField("Nut Removal", EditorStyles.boldLabel);
+        serializedObject.Update();
+        EditorGUILayout.PropertyField(
+            serializedObject.FindProperty("unscrewingSettings"),
+            new GUIContent("Unscrewing Settings"));
+        serializedObject.ApplyModifiedProperties();
+        DrawUnscrewingSettings(preview);
+        if (!Application.isPlaying)
+        {
+            EditorGUILayout.HelpBox(
+                "Enter Play Mode to remove nuts. Edit Mode keeps every nut visible. Removal state resets each time Play Mode starts.",
+                MessageType.Info);
+            return;
+        }
+
+        MonolithNutState state = preview.NutState;
+        if (preview.BandSettings == null || preview.NutSettings == null || state == null)
+        {
+            EditorGUILayout.HelpBox("Show the four-face band so the nut state can be created.", MessageType.Warning);
+            return;
+        }
+
+        if (!preview.ShowPreview)
+        {
+            EditorGUILayout.HelpBox("Show Four-Face Band is off, so removals will not be visible until it is turned on.", MessageType.Warning);
+        }
+
+        int face = SessionState.GetInt(FaceKey, 0);
+        int column = SessionState.GetInt(ColumnKey, 0);
+        int row = SessionState.GetInt(RowKey, 0);
+        face = Mathf.Clamp(face, 0, state.FaceCount - 1);
+        column = Mathf.Clamp(column, 0, state.ColumnCount - 1);
+        row = Mathf.Clamp(row, 0, state.RowCount - 1);
+
+        EditorGUI.BeginChangeCheck();
+        face = EditorGUILayout.IntSlider("Face", face, 0, state.FaceCount - 1);
+        column = EditorGUILayout.IntSlider("Column", column, 0, state.ColumnCount - 1);
+        row = EditorGUILayout.IntSlider("Row", row, 0, state.RowCount - 1);
+        if (EditorGUI.EndChangeCheck())
+        {
+            SessionState.SetInt(FaceKey, face);
+            SessionState.SetInt(ColumnKey, column);
+            SessionState.SetInt(RowKey, row);
+        }
+
+        var rod = new MonolithRodId(face, column, row);
+        bool animating = preview.IsRodAnimating(rod);
+        EditorGUILayout.LabelField("Selected rod remaining nuts", state.Remaining(rod).ToString());
+        EditorGUILayout.LabelField("Total removed nuts", state.RemovedCount.ToString());
+        EditorGUILayout.Space();
+        EditorGUILayout.LabelField("Detached Nut Debug", EditorStyles.boldLabel);
+        EditorGUILayout.LabelField("Active Unscrewing Animations", preview.ActiveUnscrewingCount.ToString());
+        EditorGUILayout.LabelField("Completed Detachments", preview.CompletedDetachmentCount.ToString());
+        EditorGUILayout.LabelField("Active Physics Nuts", preview.ActivePhysicsNutCount.ToString());
+        EditorGUILayout.LabelField("Inactive Pooled Nuts", preview.InactivePooledNutCount.ToString());
+        EditorGUILayout.LabelField("Total Pool Size", preview.TotalPoolSize.ToString());
+        EditorGUILayout.LabelField("Total Removed Nuts", preview.TotalRemovedNuts.ToString());
+        EditorGUILayout.HelpBox(
+            "Remove One Nut hides the outermost nut immediately. Animate One Nut spins that nut off the tip, then drops it as a physics object. The counter changes once, when the nut leaves the rod.",
+            MessageType.None);
+
+        if (animating)
+        {
+            EditorGUILayout.HelpBox(
+                "This rod is unscrewing. Remaining nuts and Total Removed stay unchanged until the nut clears the tip.",
+                MessageType.None);
+        }
+
+        using (new EditorGUI.DisabledScope(state.Remaining(rod) == 0 || animating))
+        {
+            if (GUILayout.Button("Remove One Nut", GUILayout.Height(ButtonHeight)))
+                preview.TryRemoveOneNut(rod);
+        }
+
+        using (new EditorGUI.DisabledScope(state.Remaining(rod) == 0 || animating || preview.UnscrewingSettings == null))
+        {
+            if (GUILayout.Button("Animate One Nut", GUILayout.Height(ButtonHeight)))
+                preview.TryAnimateOneNut(rod);
+        }
+
+        using (new EditorGUI.DisabledScope(state.RemovedCount == 0 && !preview.HasActiveUnscrewing))
+        {
+            if (GUILayout.Button("Reset All Nuts", GUILayout.Height(ButtonHeight)))
+                preview.ResetAllNuts();
+        }
+    }
+
+    static void DrawUnscrewingSettings(MonolithFourFaceBandPreviewRenderer preview)
+    {
+        if (preview.UnscrewingSettings == null)
+        {
+            EditorGUILayout.HelpBox(
+                "Assign Nut Unscrewing Settings. The asset is Assets/Settings/MonolithNutUnscrewingSettings.",
+                MessageType.Warning);
+            return;
+        }
+
+        var settings = new SerializedObject(preview.UnscrewingSettings);
+        settings.Update();
+        EditorGUILayout.PropertyField(settings.FindProperty("movementSpeed"), new GUIContent("Movement Speed"));
+        EditorGUILayout.PropertyField(settings.FindProperty("rotationSpeed"), new GUIContent("Rotation Speed"));
+        EditorGUILayout.PropertyField(settings.FindProperty("minimumDuration"), new GUIContent("Minimum Duration"));
+        EditorGUILayout.Space();
+        EditorGUILayout.LabelField("Detached Nut Physics", EditorStyles.boldLabel);
+        EditorGUILayout.PropertyField(settings.FindProperty("mass"), new GUIContent("Mass"));
+        EditorGUILayout.PropertyField(settings.FindProperty("bounciness"), new GUIContent("Bounciness"));
+        EditorGUILayout.PropertyField(settings.FindProperty("friction"), new GUIContent("Friction"));
+        EditorGUILayout.PropertyField(settings.FindProperty("outwardVelocity"), new GUIContent("Outward Velocity"));
+        EditorGUILayout.PropertyField(settings.FindProperty("angularVelocity"), new GUIContent("Angular Velocity"));
+        settings.ApplyModifiedProperties();
     }
 }
